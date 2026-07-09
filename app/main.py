@@ -7,6 +7,14 @@ from .routers import admin, auth, bookings, health, rooms
 
 Base.metadata.create_all(bind=engine)
 
+from .database import SessionLocal
+from .services.stats import init_stats
+db = SessionLocal()
+try:
+    init_stats(db)
+finally:
+    db.close()
+
 app = FastAPI(title="CoWork API", version="1.0.0")
 
 app.add_exception_handler(AppError, app_error_handler)
