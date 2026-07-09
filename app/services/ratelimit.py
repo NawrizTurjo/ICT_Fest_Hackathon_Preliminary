@@ -23,7 +23,7 @@ def record_and_check(user_id: int) -> None:
     _settle_pause()
     now = time.time()
     with _buckets_lock:
-        bucket = _buckets.get(user_id, [])
+        bucket = _buckets.get(user_id, [])[:]
         # Trim expired entries from the rolling window.
         bucket = [t for t in bucket if t > now - _WINDOW_SECONDS]
         # BUG 14: Check BEFORE appending so the 20th request is the last allowed
@@ -31,4 +31,7 @@ def record_and_check(user_id: int) -> None:
         if len(bucket) >= _MAX_REQUESTS:
             raise AppError(429, "RATE_LIMITED", "Too many booking requests")
         bucket.append(now)
-        _buckets[user_id] = bucket
+        if bucket:
+            _buckets[user_id] = bucket
+        else:
+            _buckets.pop(user_id, None)

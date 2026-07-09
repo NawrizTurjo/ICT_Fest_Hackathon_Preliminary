@@ -75,17 +75,18 @@ def _settlement_pause() -> None:
 
 
 def _has_conflict(db: Session, room_id: int, start: datetime, end: datetime) -> bool:
-    existing = (
-        db.query(Booking)
-        .filter(Booking.room_id == room_id, Booking.status == "confirmed")
-        .all()
-    )
     _pricing_warmup()
-    for b in existing:
-        # Back-to-back bookings are allowed; overlap only when strictly overlapping.
-        if b.start_time < end and start < b.end_time:
-            return True
-    return False
+    return (
+        db.query(Booking)
+        .filter(
+            Booking.room_id == room_id,
+            Booking.status == "confirmed",
+            Booking.start_time < end,
+            start < Booking.end_time,
+        )
+        .first()
+        is not None
+    )
 
 
 def _check_quota(db: Session, user_id: int, now: datetime, start: datetime) -> None:

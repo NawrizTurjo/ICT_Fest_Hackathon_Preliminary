@@ -5,6 +5,7 @@ endpoint can serve them without re-aggregating the whole booking table.
 """
 import threading
 import time
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 _stats: dict[int, dict] = {}
@@ -44,11 +45,22 @@ def get(room_id: int) -> dict:
 
 def init_stats(db: Session) -> None:
     """Initialize in-memory statistics from the database on startup."""
+    from ..models import Booking
+
     with _stats_lock:
         _stats.clear()
-        from ..models import Booking
-        bookings = db.query(Booking).filter(Booking.status == "confirmed").all()
-        for b in bookings:
-            current = _stats.setdefault(b.room_id, {"count": 0, "revenue": 0})
-            current["count"] += 1
-            current["revenue"] += b.price_cents
+        agg_rows = (
+            db.query(
+                Booking.room_id,
+                func.count(Booking.id).label("cnt"),
+                func.sum(Booking.price_cents).label("rev"),
+            )
+            .filter(Booking.status == "confirmed")
+            .group_by(Booking.room_id)
+            .all()
+        )
+        for row in agg_rows:
+            _stats[row.room_id] = {
+                "count": row.cnt,
+                "revenue": row.rev or 0,
+            }

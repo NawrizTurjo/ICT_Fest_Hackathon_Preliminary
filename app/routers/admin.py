@@ -1,8 +1,10 @@
 """Administrative reporting and export endpoints."""
+from collections import defaultdict
 from datetime import datetime, time, timedelta
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import Response
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from .. import cache
@@ -36,24 +38,35 @@ def usage_report(
     range_end = datetime.combine(to_date + timedelta(days=1), time.min)
 
     rooms = db.query(Room).filter(Room.org_id == admin.org_id).order_by(Room.id.asc()).all()
+
+    # Single aggregated query instead of N+1 per-room queries.
+    agg_rows = (
+        db.query(
+            Booking.room_id,
+            func.count(Booking.id).label("cnt"),
+            func.sum(Booking.price_cents).label("rev"),
+        )
+        .join(Room, Booking.room_id == Room.id)
+        .filter(
+            Room.org_id == admin.org_id,
+            Booking.status == "confirmed",
+            Booking.start_time >= range_start,
+            Booking.start_time < range_end,
+        )
+        .group_by(Booking.room_id)
+        .all()
+    )
+    agg = {row.room_id: (row.cnt, row.rev or 0) for row in agg_rows}
+
     room_rows = []
     for room in rooms:
-        bookings = (
-            db.query(Booking)
-            .filter(
-                Booking.room_id == room.id,
-                Booking.status == "confirmed",
-                Booking.start_time >= range_start,
-                Booking.start_time < range_end,
-            )
-            .all()
-        )
+        cnt, rev = agg.get(room.id, (0, 0))
         room_rows.append(
             {
                 "room_id": room.id,
                 "room_name": room.name,
-                "confirmed_bookings": len(bookings),
-                "revenue_cents": sum(b.price_cents for b in bookings),
+                "confirmed_bookings": cnt,
+                "revenue_cents": rev,
             }
         )
 
