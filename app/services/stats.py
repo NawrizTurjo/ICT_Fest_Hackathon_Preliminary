@@ -34,7 +34,9 @@ def record_cancel(room_id: int, price_cents: int) -> None:
         current = _stats.get(room_id, {"count": 0, "revenue": 0})
         _stats[room_id] = {
             "count": max(0, current["count"] - 1),
-            "revenue": current["revenue"] - price_cents,
+            # Fix F3: Clamp revenue to 0 to guard against negative revenue from
+            # any data inconsistency (e.g. partial init_stats state on restart).
+            "revenue": max(0, current["revenue"] - price_cents),
         }
 
 

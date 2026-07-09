@@ -128,10 +128,12 @@ def create_booking(
     if end <= start:
         raise AppError(400, "INVALID_BOOKING_WINDOW", "end_time must be after start_time")
 
-    duration_hours = (end - start).total_seconds() / 3600
-    if duration_hours != int(duration_hours):
+    total_seconds = int((end - start).total_seconds())
+    # Fix F2: Use integer seconds to avoid floating-point rounding errors.
+    # e.g. 3599.9999... seconds would pass the old float != int check incorrectly.
+    if total_seconds % 3600 != 0:
         raise AppError(400, "INVALID_BOOKING_WINDOW", "duration must be a whole number of hours")
-    duration_hours = int(duration_hours)
+    duration_hours = total_seconds // 3600
 
     # BUG 7: Enforce minimum duration of 1 hour.
     if duration_hours < MIN_DURATION_HOURS:
@@ -151,6 +153,10 @@ def create_booking(
             if _has_conflict(db, room.id, start, end):
                 raise AppError(409, "ROOM_CONFLICT", "Room already booked for this interval")
 
+            # Fix F4: Re-capture `now` inside the lock after _pricing_warmup has
+            # slept, so the quota window is computed against the current clock,
+            # not a timestamp that may be 120 ms stale.
+            now = datetime.utcnow()
             _check_quota(db, user.id, now, start)
 
             price_cents = room.hourly_rate_cents * duration_hours

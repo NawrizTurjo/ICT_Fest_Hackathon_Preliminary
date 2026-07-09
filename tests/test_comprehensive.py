@@ -17,7 +17,7 @@ def setup_db():
     Base.metadata.create_all(bind=engine)
     # Reset in-memory rate limits, revoked tokens, and per-user/room locks
     from app.services import ratelimit
-    from app import auth
+    from app import auth, cache
     from app.routers import bookings as bookings_router
     ratelimit._buckets.clear()
     auth._revoked_tokens.clear()
@@ -25,6 +25,9 @@ def setup_db():
     bookings_router._user_locks.clear()
     bookings_router._room_locks.clear()
     bookings_router._booking_cancel_locks.clear()
+    # Clear response caches
+    cache._report_cache.clear()
+    cache._availability_cache.clear()
     # Re-initialize stats
     db = SessionLocal()
     try:
@@ -674,3 +677,127 @@ def test_cross_room_quota_race():
         if r.status_code == 409:
             assert r.json()["code"] == "QUOTA_EXCEEDED"
 
+
+def test_integer_duration_check():
+    """Fix F2: Duration check must use integer seconds, not floats.
+    Exactly 1-hour / 2-hour / 8-hour durations must pass; non-whole rejected."""
+    client.post("/auth/register",
+                json={"org_name": "org1", "username": "alice", "password": "pw"})
+    login = client.post("/auth/login",
+                        json={"org_name": "org1", "username": "alice", "password": "pw"})
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    room = client.post("/rooms",
+                       json={"name": "R", "capacity": 2, "hourly_rate_cents": 100},
+                       headers=headers)
+    rid = room.json()["id"]
+
+    # Exact whole-hour durations should succeed
+    for hours in [1, 2, 8]:
+        start = _future(20 + hours)
+        end = (datetime.fromisoformat(start) + timedelta(hours=hours)).isoformat()
+        r = client.post("/bookings",
+                        json={"room_id": rid, "start_time": start, "end_time": end},
+                        headers=headers)
+        assert r.status_code == 201, f"{hours}h booking failed: {r.json()}"
+        # cancel it so quota isn't exhausted
+        client.post(f"/bookings/{r.json()['id']}/cancel", headers=headers)
+
+    # 1h30m = non-whole → must reject
+    start = _future(50)
+    end = (datetime.fromisoformat(start) + timedelta(hours=1, minutes=30)).isoformat()
+    r = client.post("/bookings",
+                    json={"room_id": rid, "start_time": start, "end_time": end},
+                    headers=headers)
+    assert r.status_code == 400
+    assert r.json()["code"] == "INVALID_BOOKING_WINDOW"
+
+
+def test_cache_thread_safety():
+    """Fix F1: Concurrent reads/writes to the cache must not raise RuntimeError."""
+    import concurrent.futures
+    from app import cache
+
+    # Populate some keys
+    for i in range(20):
+        cache.set_report(i, "2026-01-01", "2026-01-31", {"rooms": []})
+        cache.set_availability(i, "2026-01-01", {"busy": []})
+
+    errors = []
+
+    def stress():
+        try:
+            for i in range(20):
+                cache.set_report(i, "2026-01-01", "2026-01-31", {"rooms": []})
+                cache.get_report(i, "2026-01-01", "2026-01-31")
+                cache.invalidate_report(i % 5)
+                cache.set_availability(i, "2026-01-01", {"busy": []})
+                cache.get_availability(i, "2026-01-01")
+                cache.invalidate_availability(i % 5, "2026-01-01")
+        except RuntimeError as e:
+            errors.append(str(e))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+        futs = [ex.submit(stress) for _ in range(10)]
+        for f in concurrent.futures.as_completed(futs):
+            f.result()
+
+    assert not errors, f"Thread-safety errors: {errors}"
+
+
+def test_availability_reflects_cancellation():
+    """Rule 13: availability must reflect current state immediately, including after cancel."""
+    client.post("/auth/register",
+                json={"org_name": "org1", "username": "alice", "password": "pw"})
+    login = client.post("/auth/login",
+                        json={"org_name": "org1", "username": "alice", "password": "pw"})
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    room = client.post("/rooms",
+                       json={"name": "R", "capacity": 2, "hourly_rate_cents": 100},
+                       headers=headers)
+    rid = room.json()["id"]
+
+    # Create booking tomorrow 10:00–11:00
+    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date()
+    start = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 10, 0, 0,
+                     tzinfo=timezone.utc).isoformat()
+    end = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 11, 0, 0,
+                   tzinfo=timezone.utc).isoformat()
+    b = client.post("/bookings",
+                    json={"room_id": rid, "start_time": start, "end_time": end},
+                    headers=headers)
+    assert b.status_code == 201
+
+    avail1 = client.get(f"/rooms/{rid}/availability?date={tomorrow.isoformat()}",
+                        headers=headers).json()
+    assert len(avail1["busy"]) == 1
+
+    # Cancel → availability must immediately show empty
+    client.post(f"/bookings/{b.json()['id']}/cancel", headers=headers)
+
+    avail2 = client.get(f"/rooms/{rid}/availability?date={tomorrow.isoformat()}",
+                        headers=headers).json()
+    assert len(avail2["busy"]) == 0, "Availability cache not invalidated after cancellation"
+
+
+def test_stats_no_negative_revenue():
+    """Fix F3: revenue in stats must never go negative."""
+    client.post("/auth/register",
+                json={"org_name": "org1", "username": "alice", "password": "pw"})
+    login = client.post("/auth/login",
+                        json={"org_name": "org1", "username": "alice", "password": "pw"})
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    room = client.post("/rooms",
+                       json={"name": "R", "capacity": 2, "hourly_rate_cents": 500},
+                       headers=headers)
+    rid = room.json()["id"]
+
+    # Create and immediately cancel a booking
+    b = client.post("/bookings",
+                    json={"room_id": rid, "start_time": _future(50), "end_time": _future(51)},
+                    headers=headers)
+    assert b.status_code == 201
+    client.post(f"/bookings/{b.json()['id']}/cancel", headers=headers)
+
+    s = client.get(f"/rooms/{rid}/stats", headers=headers).json()
+    assert s["total_confirmed_bookings"] >= 0
+    assert s["total_revenue_cents"] >= 0

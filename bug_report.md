@@ -424,3 +424,65 @@ class RoomCreateRequest(BaseModel):
     capacity: int
     hourly_rate_cents: int = Field(ge=0)
 ```
+
+---
+
+## 2nd Iteration Audit — Additional Bugs
+
+### Fix F1 — Hard | `app/cache.py` — No thread safety on cache dicts
+
+**File/Line:** `app/cache.py` (all functions)
+
+**Bug:** `_report_cache` and `_availability_cache` are plain `dict` objects mutated from multiple threads with no synchronization. In CPython, individual dict `__setitem__` / `__getitem__` are GIL-protected, but `invalidate_report` does:
+```python
+for key in [k for k in _report_cache if k[0] == org_id]:
+    _report_cache.pop(key, None)
+```
+Between building the list comprehension and iterating through it, another thread can add or remove keys. More critically, if two threads call `invalidate_report` concurrently, the `pop` can race and raise `KeyError`, and building the list comprehension while another thread pops can cause the iterator to see a mutated object. In Python 3.12+ with the experimental free-threading mode (no GIL), this would be a definite data race.
+
+**Impact:** Concurrent report invalidation (e.g. simultaneous booking creates for different rooms in the same org) risks `RuntimeError: dictionary changed size during iteration` or silently stale cache entries.
+
+**Fix:** Added `_cache_lock = threading.Lock()` and wrapped every `get`, `set`, and `invalidate` function body in `with _cache_lock:`.
+
+---
+
+### Fix F2 — Medium | `app/routers/bookings.py:131-134` — Float equality for duration check
+
+**File/Line:** `app/routers/bookings.py:131-134`
+
+**Bug:** `duration_hours = (end - start).total_seconds() / 3600` followed by `if duration_hours != int(duration_hours)` uses floating-point division and equality. For any timedelta that is exactly N hours in seconds, Python's float division should produce an exact result, but floating-point arithmetic is not guaranteed to be exact. For example, `timedelta(hours=3).total_seconds()` = `10800.0`, and `10800.0 / 3600` = `3.0` exactly in CPython — however this relies on IEEE 754 guarantee that is implementation-specific. More importantly, this approach is semantically fragile: if the input has sub-second precision (e.g. `10800.001` seconds), the float check would pass where it should fail.
+
+**Impact:** Edge-case durations that round to a whole number of hours in float arithmetic but are not exact whole hours may slip through validation.
+
+**Fix:** Replaced with integer-seconds modulo check:
+```python
+total_seconds = int((end - start).total_seconds())
+if total_seconds % 3600 != 0:
+    raise AppError(...)
+duration_hours = total_seconds // 3600
+```
+This is exact, fast, and unambiguous regardless of floating-point rounding.
+
+---
+
+### Fix F3 — Medium | `app/services/stats.py:31-38` — Negative revenue possible in `record_cancel`
+
+**File/Line:** `app/services/stats.py:34-38`
+
+**Bug:** `record_cancel` decrements `current["revenue"] - price_cents` with no lower bound. If `_stats` is ever in a state where the tracked revenue is less than the booking's price (e.g. after a restart where `init_stats` ran before all in-flight bookings committed, or if a booking was cancelled without a prior successful `record_create`), `revenue` goes negative, which is semantically invalid and corrupts `GET /rooms/{id}/stats` responses.
+
+**Impact:** The stats endpoint can return negative `total_revenue_cents`, which is a logical error that violates Rule 14.
+
+**Fix:** Added `max(0, ...)` clamp: `"revenue": max(0, current["revenue"] - price_cents)`.
+
+---
+
+### Fix F4 — Medium | `app/routers/bookings.py:121` — Stale `now` used for quota window
+
+**File/Line:** `app/routers/bookings.py:121,154`
+
+**Bug:** `now = datetime.utcnow()` is captured before the user lock is acquired and before `_pricing_warmup()` sleeps 120 ms. The captured `now` is then passed to `_check_quota`, which uses it to compute the 24-hour rolling window boundary: `window_end = now + timedelta(hours=24)`. Because `now` is up to 120 ms stale by the time `_check_quota` runs, the window boundary is slightly off. In practice this is a sub-second discrepancy, but it means bookings starting almost exactly 24 hours from the original request time might be incorrectly included or excluded from the quota count.
+
+**Impact:** Quota window boundary has up to 120 ms of drift, which could cause bookings at the exact boundary of the 24-hour window to be counted or not counted erroneously.
+
+**Fix:** Re-capture `now = datetime.utcnow()` immediately inside the lock, after `_has_conflict` (which calls `_pricing_warmup`) has returned, so the quota check uses the current clock.
