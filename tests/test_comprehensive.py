@@ -15,12 +15,16 @@ def setup_db():
     # Re-create database schemas before each test to have a clean state
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
-    # Reset in-memory rate limits, revoked tokens
+    # Reset in-memory rate limits, revoked tokens, and per-user/room locks
     from app.services import ratelimit
     from app import auth
+    from app.routers import bookings as bookings_router
     ratelimit._buckets.clear()
     auth._revoked_tokens.clear()
     auth._revoked_refresh_jtis.clear()
+    bookings_router._user_locks.clear()
+    bookings_router._room_locks.clear()
+    bookings_router._booking_cancel_locks.clear()
     # Re-initialize stats
     db = SessionLocal()
     try:
@@ -611,3 +615,62 @@ def test_live_stats_and_immediate_reports():
     rep2 = client.get(f"/admin/usage-report?from={today}&to={tomorrow}", headers=headers).json()
     assert rep2["rooms"][0]["confirmed_bookings"] == 0
     assert rep2["rooms"][0]["revenue_cents"] == 0
+
+
+def test_cross_room_quota_race():
+    """Extra Bug E: Concurrent booking requests to DIFFERENT rooms for the same
+    user must still respect the 3-booking-per-24h quota (cross-room race)."""
+    import concurrent.futures
+
+    client.post(
+        "/auth/register",
+        json={"org_name": "org1", "username": "admin", "password": "password123"}
+    )
+    login = client.post(
+        "/auth/login",
+        json={"org_name": "org1", "username": "admin", "password": "password123"}
+    )
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    # Create 4 distinct rooms
+    room_ids = []
+    for i in range(4):
+        r = client.post(
+            "/rooms",
+            json={"name": f"Room {i}", "capacity": 4, "hourly_rate_cents": 100},
+            headers=headers
+        )
+        room_ids.append(r.json()["id"])
+
+    # Fire 4 concurrent booking requests, each targeting a different room,
+    # all in the 24-hour window — only 3 should succeed.
+    results = []
+
+    def book(room_id, start_h, end_h):
+        return client.post(
+            "/bookings",
+            json={"room_id": room_id, "start_time": _future(start_h), "end_time": _future(end_h)},
+            headers=headers,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        futures = [
+            ex.submit(book, room_ids[0], 2, 3),
+            ex.submit(book, room_ids[1], 4, 5),
+            ex.submit(book, room_ids[2], 6, 7),
+            ex.submit(book, room_ids[3], 8, 9),
+        ]
+        for f in concurrent.futures.as_completed(futures):
+            results.append(f.result())
+
+    statuses = [r.status_code for r in results]
+    confirmed = statuses.count(201)
+    exceeded = statuses.count(409)
+
+    # Exactly 3 requests must succeed and at least 1 must fail with QUOTA_EXCEEDED
+    assert confirmed == 3, f"Expected 3 bookings, got {confirmed}. Statuses: {statuses}"
+    assert exceeded >= 1, f"Expected at least 1 QUOTA_EXCEEDED, got {exceeded}. Statuses: {statuses}"
+    for r in results:
+        if r.status_code == 409:
+            assert r.json()["code"] == "QUOTA_EXCEEDED"
+

@@ -32,12 +32,24 @@ _room_locks_lock = threading.Lock()
 _booking_cancel_locks: dict[int, threading.Lock] = {}
 _booking_cancel_locks_lock = threading.Lock()
 
+# Extra Bug E: Per-user locks prevent quota bypass when a user concurrently
+# books different rooms (cross-room quota race).
+_user_locks: dict[int, threading.Lock] = {}
+_user_locks_lock = threading.Lock()
+
 
 def _get_room_lock(room_id: int) -> threading.Lock:
     with _room_locks_lock:
         if room_id not in _room_locks:
             _room_locks[room_id] = threading.Lock()
         return _room_locks[room_id]
+
+
+def _get_user_lock(user_id: int) -> threading.Lock:
+    with _user_locks_lock:
+        if user_id not in _user_locks:
+            _user_locks[user_id] = threading.Lock()
+        return _user_locks[user_id]
 
 
 def _get_booking_cancel_lock(booking_id: int) -> threading.Lock:
@@ -130,28 +142,30 @@ def create_booking(
     if room is None:
         raise AppError(404, "ROOM_NOT_FOUND", "Room not found")
 
-    # BUG 15: Hold the room lock while checking conflict + inserting to prevent
-    # two concurrent requests from both passing the conflict check.
-    with _get_room_lock(room.id):
-        if _has_conflict(db, room.id, start, end):
-            raise AppError(409, "ROOM_CONFLICT", "Room already booked for this interval")
+    # Extra Bug E fix: acquire user lock first (quota scope), then room lock
+    # (conflict scope). Consistent ordering (user → room) prevents deadlocks
+    # while ensuring the quota check is serialised across all rooms.
+    with _get_user_lock(user.id):
+        with _get_room_lock(room.id):
+            if _has_conflict(db, room.id, start, end):
+                raise AppError(409, "ROOM_CONFLICT", "Room already booked for this interval")
 
-        _check_quota(db, user.id, now, start)
+            _check_quota(db, user.id, now, start)
 
-        price_cents = room.hourly_rate_cents * duration_hours
-        booking = Booking(
-            room_id=room.id,
-            user_id=user.id,
-            start_time=start,
-            end_time=end,
-            status="confirmed",
-            reference_code=reference.next_reference_code(),
-            price_cents=price_cents,
-            created_at=now,
-        )
-        db.add(booking)
-        db.commit()
-        db.refresh(booking)
+            price_cents = room.hourly_rate_cents * duration_hours
+            booking = Booking(
+                room_id=room.id,
+                user_id=user.id,
+                start_time=start,
+                end_time=end,
+                status="confirmed",
+                reference_code=reference.next_reference_code(),
+                price_cents=price_cents,
+                created_at=now,
+            )
+            db.add(booking)
+            db.commit()
+            db.refresh(booking)
 
     stats.record_create(room.id, price_cents)
     cache.invalidate_availability(room.id, start.date().isoformat())

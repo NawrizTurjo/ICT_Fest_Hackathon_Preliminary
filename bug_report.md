@@ -265,3 +265,27 @@ For cancellation: two concurrent cancel requests both read `booking.status == "c
 
 **Fix:** Changed `cancel_booking`'s rounding logic to use `decimal.Decimal` with `ROUND_HALF_UP` to match `log_refund`.
 
+---
+
+## Extra Bug E — Hard | Cross-Room Quota Race Condition
+
+**File/Line:** `app/routers/bookings.py:133-154`
+
+**Bug:** The per-room lock (`_get_room_lock(room.id)`) correctly serialises concurrent booking requests **for the same room**, preventing double-bookings. However, the 3-booking quota (Rule 4) applies *across all rooms* in an org, not just one room. Because the locks are partitioned by `room_id`, concurrent requests to **different rooms** acquire different locks and execute simultaneously:
+
+1. Thread 1 acquires `_room_locks[A]`, Thread 2 acquires `_room_locks[B]`, etc.
+2. All threads call `_check_quota()`, which queries the DB and then sleeps for 100 ms (`_quota_audit()`).
+3. Since they sleep concurrently and none has committed yet, all see `count = 0` and all pass the quota check.
+4. All four threads commit — the user ends up with 4 confirmed bookings in the 24-hour window.
+
+**Impact:** A user can exceed the 3-booking-per-24h quota by submitting simultaneous requests to different rooms, violating Rule 4. This is a hard concurrency bug exploitable with a simple parallel script.
+
+**Fix:** Added a per-user lock (`_user_locks`) that is acquired **before** the per-room lock. The lock hierarchy is always `user → room` (consistent ordering prevents deadlocks). The quota check and booking commit now run under both locks, serialising all booking attempts for the same user regardless of which room they target.
+
+```python
+with _get_user_lock(user.id):          # serialises all of this user's bookings
+    with _get_room_lock(room.id):       # prevents double-booking same room
+        _check_quota(...)               # now safe: no concurrent sibling can pass
+        db.add(booking)
+        db.commit()
+```
