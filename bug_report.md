@@ -289,3 +289,138 @@ with _get_user_lock(user.id):          # serialises all of this user's bookings
         db.add(booking)
         db.commit()
 ```
+
+## Advanced Optimizations & Edge Case Fixes
+
+---
+
+### Fix 1: O(N) Memory Load in Conflict Check
+
+**File:** `app/routers/bookings.py` (Function: `_has_conflict`)
+
+**Bug:** The original implementation fetched all confirmed bookings for a room using `.all()` and then iterated over them in Python to check for overlapping time intervals. This caused an O(N) memory load proportional to the total number of bookings for a room, creating a risk of high memory consumption and slow conflict detection as booking volume grows.
+
+**Fix:** Optimized `_has_conflict` to use a single O(1) DB-side interval query instead of loading all confirmed bookings into Python memory. The overlap condition (`existing.start_time < end AND start < existing.end_time`) is now evaluated entirely by the database engine, and the result is returned using `.first() is not None` — a boolean with no ORM object materialization.
+
+```python
+return (
+    db.query(Booking)
+    .filter(
+        Booking.room_id == room_id,
+        Booking.status == "confirmed",
+        Booking.start_time < end,
+        start < Booking.end_time,
+    )
+    .first()
+    is not None
+)
+```
+
+---
+
+### Fix 2: N+1 Query Problem in Usage Report
+
+**File:** `app/routers/admin.py` (Function: `usage_report`)
+
+**Bug:** The original implementation first fetched all rooms for an org, then executed a separate `db.query(Booking)` inside a loop for each individual room. This is a classic N+1 query problem: for an org with N rooms, the endpoint fired N+1 database round-trips, causing severe performance degradation at scale.
+
+**Fix:** Refactored `usage_report` to use a single `GROUP BY room_id` query with `func.count` and `func.sum` to fetch all aggregated data in one database call. The result is stored in a lookup dictionary keyed by `room_id`, and room rows are then assembled in a single Python pass with O(1) lookups per room.
+
+```python
+agg_rows = (
+    db.query(
+        Booking.room_id,
+        func.count(Booking.id).label("cnt"),
+        func.sum(Booking.price_cents).label("rev"),
+    )
+    .join(Room, Booking.room_id == Room.id)
+    .filter(Room.org_id == admin.org_id, Booking.status == "confirmed", ...)
+    .group_by(Booking.room_id)
+    .all()
+)
+agg = {row.room_id: (row.cnt, row.rev or 0) for row in agg_rows}
+```
+
+---
+
+### Fix 3: OOM Risk in Stats Initialization
+
+**File:** `app/services/stats.py` (Function: `init_stats`)
+
+**Bug:** On server startup, `init_stats` fetched every single confirmed `Booking` ORM object into memory using `.all()` and then aggregated counts and revenue in a Python loop. On a production database with thousands or millions of bookings, this caused an out-of-memory (OOM) risk at startup since entire rows were materialized as Python objects purely to compute two scalar values per room.
+
+**Fix:** Changed `init_stats` to use SQL aggregation (`func.count`, `func.sum`) grouped by `room_id` rather than fetching full ORM objects. Only the compact aggregated scalar rows are returned and stored, making startup memory usage O(number of distinct rooms) instead of O(total bookings).
+
+```python
+agg_rows = (
+    db.query(
+        Booking.room_id,
+        func.count(Booking.id).label("cnt"),
+        func.sum(Booking.price_cents).label("rev"),
+    )
+    .filter(Booking.status == "confirmed")
+    .group_by(Booking.room_id)
+    .all()
+)
+for row in agg_rows:
+    _stats[row.room_id] = {"count": row.cnt, "revenue": row.rev or 0}
+```
+
+---
+
+### Fix 4: Memory Leak in Rate Limiter
+
+**File:** `app/services/ratelimit.py` (Function: `record_and_check`)
+
+**Bug:** After filtering expired timestamps from a user's rolling window bucket, the code always wrote the (potentially empty) list back into the `_buckets` dictionary with `_buckets[user_id] = bucket`. This meant that once a user made any booking request, their key remained in `_buckets` forever — even after all their timestamps expired — causing indefinite dictionary growth and a slow memory leak in long-running servers with many distinct users.
+
+**Fix:** Added cleanup logic to remove the key from `_buckets` when the bucket becomes empty after trimming expired entries. The `_buckets.pop(user_id, None)` call ensures that inactive users do not leave ghost entries in memory.
+
+```python
+bucket = [t for t in bucket if t > now - _WINDOW_SECONDS]
+# ... rate limit check and append ...
+if bucket:
+    _buckets[user_id] = bucket
+else:
+    _buckets.pop(user_id, None)
+```
+
+---
+
+### Fix 5: Race Condition in Org Registration
+
+**File:** `app/routers/auth.py` (Function: `register`)
+
+**Bug:** A race condition existed when two users concurrently tried to register a new organization with the same name. Both requests would query for the org, both would see `org is None`, and both would call `db.add(org)` and `db.commit()`. The second commit would raise a `sqlalchemy.exc.IntegrityError` (due to the `UNIQUE` constraint on `organizations.name`), causing an unhandled 500 Internal Server Error crash.
+
+**Fix:** Wrapped the Organization creation and commit inside a `try...except IntegrityError` block. If the commit fails due to a concurrent duplicate insertion, the transaction is rolled back, the already-committed organization is re-fetched from the database, and the registering user is correctly assigned the `member` role instead of crashing.
+
+```python
+if org is None:
+    try:
+        org = Organization(name=payload.org_name)
+        db.add(org)
+        db.commit()
+        db.refresh(org)
+    except IntegrityError:
+        db.rollback()
+        org = db.query(Organization).filter(Organization.name == payload.org_name).first()
+        role = "member"
+```
+
+---
+
+### Fix 6: Negative Hourly Rate Accepted
+
+**File:** `app/schemas.py` (Class: `RoomCreateRequest`)
+
+**Bug:** The `hourly_rate_cents` field in `RoomCreateRequest` was declared as a plain `int` with no bounds validation. This allowed API clients to create rooms with a negative hourly rate, which is nonsensical business logic and could cause negative `price_cents` values to be stored in bookings, corrupting revenue calculations and reports.
+
+**Fix:** Added `Field(ge=0)` Pydantic validation to `hourly_rate_cents` to enforce that the value must be greater than or equal to zero. Pydantic now rejects negative values at the request parsing layer with a `422 Unprocessable Entity` response before any database or business logic is reached.
+
+```python
+class RoomCreateRequest(BaseModel):
+    name: str
+    capacity: int
+    hourly_rate_cents: int = Field(ge=0)
+```
